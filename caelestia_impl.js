@@ -9,79 +9,56 @@ const SLIDE_MS = 220;
 const OVERSHOOT_MS = 70;
 const RETURN_MS = 120;
 
-let _dockHiddenBySwitch = false;
-
 function getDocks() {
     const docks = [];
     try {
         const ext = Main.extensionManager?.lookup('dash2dock-lite@icedman.github.com');
         const stateObj = ext?.stateObj;
-        if (stateObj?.docks) {
+        if (stateObj?.docks && Array.isArray(stateObj.docks)) {
             for (const d of stateObj.docks) {
-                if (d && d instanceof Clutter.Actor) {
+                if (d && typeof d.slideOut === 'function') {
                     docks.push(d);
                 }
             }
+        } else if (stateObj?.dock && typeof stateObj.dock.slideOut === 'function') {
+            docks.push(stateObj.dock);
         }
-    } catch (e) {}
-
-    // Fallback: search Main.layoutManager._chrome
-    if (docks.length === 0 && Main.layoutManager?._chrome) {
-        for (const actorData of Main.layoutManager._chrome) {
-            const actor = actorData.actor;
-            if (actor && (actor.has_style_class_name?.('dash') || actor.constructor?.name?.toLowerCase().includes('dock'))) {
-                docks.push(actor);
-            }
-        }
+    } catch (e) {
+        console.error('[Caelestia Workspaces] Error getting docks:', e);
     }
+
     return docks;
 }
 
-function hideDocks(duration = 180) {
+function hideDocks() {
     const docks = getDocks();
-    if (docks.length === 0)
-        return;
-
-    _dockHiddenBySwitch = true;
-
     for (const dock of docks) {
-        dock.remove_transition('translation_y');
-        dock.remove_transition('opacity');
+        dock._switchingWorkspace = true;
 
-        const dist = (dock.height || 70) + 30;
-        dock.ease({
-            translation_y: dist,
-            opacity: 0,
-            duration,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-        });
+        // Ensure slideIn is guarded during workspace switch
+        if (!dock._caelestiaHooked) {
+            dock._caelestiaHooked = true;
+            const origSlideIn = dock.slideIn.bind(dock);
+            dock.slideIn = function() {
+                if (this._switchingWorkspace)
+                    return;
+                origSlideIn();
+            };
+        }
+
+        dock.slideOut();
     }
 }
 
-function showDocks(duration = 240) {
-    if (!_dockHiddenBySwitch)
-        return;
-
-    _dockHiddenBySwitch = false;
+function showDocks() {
     const docks = getDocks();
-
     for (const dock of docks) {
-        dock.remove_transition('translation_y');
-        dock.remove_transition('opacity');
-
-        const shouldBeVisible = !dock._hidden;
-
-        dock.ease({
-            translation_y: 0,
-            opacity: shouldBeVisible ? 255 : 0,
-            duration,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            onComplete: () => {
-                if (dock.extension?.checkHide) {
-                    dock.extension.checkHide();
-                }
-            },
-        });
+        dock._switchingWorkspace = false;
+        if (dock.autohider && dock.extension?.autohide_dash) {
+            dock.autohider._checkHide();
+        } else if (typeof dock.slideIn === 'function') {
+            dock.slideIn();
+        }
     }
 }
 
@@ -104,15 +81,16 @@ export default class CaelestiaImpl {
         this._origBaseDistanceDesc = null;
         this._origEaseProperty = null;
         this._origAnimateSwitch = null;
-        this._origSwitchWorkspaceBegin = null;
         this._origFinishWorkspaceSwitch = null;
+        this._swipeTrackerBeginId = null;
+        this._activeWsChangedId = null;
     }
 
     enable() {
         if (this._origBaseDistanceDesc)
             return;
 
-        // 1. Seamless 0px gap between desktops
+        // 1. Seamless 0px gap between desktops (macOS Spaces style)
         this._origBaseDistanceDesc = Object.getOwnPropertyDescriptor(
             WorkspaceAnimation.MonitorGroup.prototype,
             'baseDistance'
@@ -127,31 +105,44 @@ export default class CaelestiaImpl {
             enumerable: true,
         });
 
-        // 2. Dock Ducking on keyboard switch
-        this._origAnimateSwitch = WorkspaceAnimation.WorkspaceAnimationController.prototype.animateSwitch;
-        const origAnimateSwitch = this._origAnimateSwitch;
-        WorkspaceAnimation.WorkspaceAnimationController.prototype.animateSwitch = function(from, to, direction, onComplete) {
-            hideDocks(180);
-            return origAnimateSwitch.call(this, from, to, direction, onComplete);
-        };
+        // 2. Dock slideOut on keyboard shortcut switch
+        const wsAnim = Main.wm?._workspaceAnimation;
+        if (wsAnim) {
+            this._origAnimateSwitch = wsAnim.animateSwitch;
+            const origAnimateSwitch = this._origAnimateSwitch;
+            wsAnim.animateSwitch = function(from, to, direction, onComplete) {
+                hideDocks();
+                return origAnimateSwitch.call(this, from, to, direction, onComplete);
+            };
 
-        // 3. Dock Ducking on touchpad gesture swipe
-        this._origSwitchWorkspaceBegin = WorkspaceAnimation.WorkspaceAnimationController.prototype._switchWorkspaceBegin;
-        const origSwitchWorkspaceBegin = this._origSwitchWorkspaceBegin;
-        WorkspaceAnimation.WorkspaceAnimationController.prototype._switchWorkspaceBegin = function(tracker, monitor) {
-            hideDocks(180);
-            return origSwitchWorkspaceBegin.call(this, tracker, monitor);
-        };
+            // 3. Dock slideIn when switch finishes
+            this._origFinishWorkspaceSwitch = wsAnim._finishWorkspaceSwitch;
+            const origFinishWorkspaceSwitch = this._origFinishWorkspaceSwitch;
+            wsAnim._finishWorkspaceSwitch = function(switchData) {
+                const res = origFinishWorkspaceSwitch.call(this, switchData);
+                showDocks();
+                return res;
+            };
 
-        // 4. Dock Return when switch finishes
-        this._origFinishWorkspaceSwitch = WorkspaceAnimation.WorkspaceAnimationController.prototype._finishWorkspaceSwitch;
-        const origFinishWorkspaceSwitch = this._origFinishWorkspaceSwitch;
-        WorkspaceAnimation.WorkspaceAnimationController.prototype._finishWorkspaceSwitch = function(switchData) {
-            showDocks(240);
-            return origFinishWorkspaceSwitch.call(this, switchData);
-        };
+            // 4. Touchpad gesture support via _swipeTracker 'begin'
+            if (wsAnim._swipeTracker) {
+                this._swipeTrackerBeginId = wsAnim._swipeTracker.connect('begin', () => {
+                    hideDocks();
+                });
+            }
+        }
 
-        // 5. Continuous Spring Overshoot: Smooth glide into overshoot + smooth return
+        // 5. Fallback workspace change listener to ensure dock is never stuck hidden
+        if (global.workspace_manager) {
+            this._activeWsChangedId = global.workspace_manager.connect('active-workspace-changed', () => {
+                // If not currently inside an active animation controller switch, ensure docks are shown
+                if (!Main.wm?._workspaceAnimation?._switchData) {
+                    showDocks();
+                }
+            });
+        }
+
+        // 6. Continuous Spring Overshoot: Smooth glide into overshoot + smooth return
         this._origEaseProperty = WorkspaceAnimation.MonitorGroup.prototype.ease_property;
         const origEaseProperty = this._origEaseProperty;
 
@@ -216,11 +207,34 @@ export default class CaelestiaImpl {
             return origEaseProperty.call(this, property, value, params);
         };
 
-        console.log('[macOS Spaces Workspaces] Connected with Dock ducking & Spring Overshoot');
+        console.log('[Caelestia Workspaces] Connected macOS Spaces transition with Rust MacDock slideOut/slideIn');
     }
 
     disable() {
-        showDocks(100);
+        showDocks();
+
+        const wsAnim = Main.wm?._workspaceAnimation;
+        if (wsAnim) {
+            if (this._origAnimateSwitch) {
+                wsAnim.animateSwitch = this._origAnimateSwitch;
+                this._origAnimateSwitch = null;
+            }
+
+            if (this._origFinishWorkspaceSwitch) {
+                wsAnim._finishWorkspaceSwitch = this._origFinishWorkspaceSwitch;
+                this._origFinishWorkspaceSwitch = null;
+            }
+
+            if (this._swipeTrackerBeginId && wsAnim._swipeTracker) {
+                wsAnim._swipeTracker.disconnect(this._swipeTrackerBeginId);
+                this._swipeTrackerBeginId = null;
+            }
+        }
+
+        if (this._activeWsChangedId && global.workspace_manager) {
+            global.workspace_manager.disconnect(this._activeWsChangedId);
+            this._activeWsChangedId = null;
+        }
 
         if (this._origBaseDistanceDesc) {
             Object.defineProperty(
@@ -231,26 +245,11 @@ export default class CaelestiaImpl {
             this._origBaseDistanceDesc = null;
         }
 
-        if (this._origAnimateSwitch) {
-            WorkspaceAnimation.WorkspaceAnimationController.prototype.animateSwitch = this._origAnimateSwitch;
-            this._origAnimateSwitch = null;
-        }
-
-        if (this._origSwitchWorkspaceBegin) {
-            WorkspaceAnimation.WorkspaceAnimationController.prototype._switchWorkspaceBegin = this._origSwitchWorkspaceBegin;
-            this._origSwitchWorkspaceBegin = null;
-        }
-
-        if (this._origFinishWorkspaceSwitch) {
-            WorkspaceAnimation.WorkspaceAnimationController.prototype._finishWorkspaceSwitch = this._origFinishWorkspaceSwitch;
-            this._origFinishWorkspaceSwitch = null;
-        }
-
         if (this._origEaseProperty) {
             WorkspaceAnimation.MonitorGroup.prototype.ease_property = this._origEaseProperty;
             this._origEaseProperty = null;
         }
 
-        console.log('[macOS Spaces Workspaces] Restored default GNOME animations');
+        console.log('[Caelestia Workspaces] Restored default GNOME animations');
     }
 }
