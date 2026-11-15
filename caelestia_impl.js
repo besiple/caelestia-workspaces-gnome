@@ -30,7 +30,8 @@ export default class CaelestiaImpl {
             enumerable: true,
         });
 
-        // 2. macOS Spaces: Apple fluid Ease-In-Ease-Out curve (~350ms)
+        // 2. macOS Spaces: Snappy, liquid-smooth Apple spring curve (EASE_OUT_QUAD, 280ms on 120Hz)
+        // Eliminates the gummy ease-in start and dead-zone crawl at the end
         this._origEaseProperty = WorkspaceAnimation.MonitorGroup.prototype.ease_property;
         const origEaseProperty = this._origEaseProperty;
 
@@ -39,14 +40,14 @@ export default class CaelestiaImpl {
                 const isKeyboardSwitch = params.duration === WorkspaceAnimation.WINDOW_ANIMATION_TIME;
                 params = {
                     ...params,
-                    duration: isKeyboardSwitch ? 350 : Math.max(280, params.duration || 350),
-                    mode: Clutter.AnimationMode.EASE_IN_OUT_CUBIC,
+                    duration: isKeyboardSwitch ? 280 : Math.max(220, Math.min(300, params.duration || 280)),
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 };
             }
             return origEaseProperty.call(this, property, value, params);
         };
 
-        console.log('[macOS Spaces Workspaces] macOS Tahoe style seamless transition active');
+        console.log('[macOS Spaces Workspaces] Liquid-smooth EASE_OUT_QUAD (280ms) active');
     }
 
     disable() {
