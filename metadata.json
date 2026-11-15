@@ -1,0 +1,16 @@
+{
+  "name": "Caelestia Slidefade Workspaces",
+  "description": "Hyprland / Caelestia style fluid slidefade (20%) workspace transition with static wallpaper and smooth deceleration curve.",
+  "uuid": "caelestia-workspaces@besiple",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51"
+  ],
+  "url": "https://github.com/besiple/caelestia-workspaces-gnome",
+  "version": 1
+}
