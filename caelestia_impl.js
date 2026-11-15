@@ -8,6 +8,8 @@ import Meta from 'gi://Meta';
 
 function createStaticBackground(monitor) {
     const container = new Meta.BackgroundGroup({
+        x: 0,
+        y: 0,
         width: monitor.width,
         height: monitor.height,
     });
@@ -58,7 +60,7 @@ export default class CaelestiaImpl {
             this.insert_child_below(createStaticBackground(monitor), null);
         };
 
-        // 2. MonitorGroup.progress: Slidefade 20% translation without altering group.x / math
+        // 2. MonitorGroup.progress: Authentic Caelestia slide over static wallpaper
         this._origProgressDesc = Object.getOwnPropertyDescriptor(
             WorkspaceAnimation.MonitorGroup.prototype,
             'progress'
@@ -71,63 +73,27 @@ export default class CaelestiaImpl {
                 return origProgressDesc.get.call(this);
             },
             set(p) {
-                // Keep stock progress setter intact (updates _container and emits notify('progress'))
+                // Keep stock progress setter intact (slides _container across screen)
                 origProgressDesc.set.call(this, p);
 
                 if (!this._workspaceGroups)
                     return;
 
-                const isVertical = global.workspace_manager.layout_rows === -1;
-                const isRTL = this.get_text_direction() === Clutter.TextDirection.RTL;
-                const monitorDim = isVertical
-                    ? (this._monitor.height || 1080)
-                    : (this._monitor.width || 1920);
-
-                // Caelestia 20% slide distance
-                const slideDistance = monitorDim * 0.20;
-
                 for (const group of this._workspaceGroups) {
                     if (!group || !group.workspace)
                         continue;
 
-                    // Ensure background clone stays hidden
+                    // Ensure wallpaper clone stays hidden so only static wallpaper shows
                     if (group._background && group._background.visible) {
                         group._background.visible = false;
                         group._background.opacity = 0;
                     }
 
-                    const groupProgress = this._getWorkspaceGroupProgress(group);
-                    const delta = groupProgress - p;
-                    const absDelta = Math.abs(delta);
-
-                    if (absDelta >= 1.0) {
-                        group.visible = false;
-                        group.opacity = 0;
-                    } else {
-                        group.visible = true;
-
-                        // Smooth crossfade
-                        const alpha = Math.max(0, Math.min(1, 1.0 - absDelta));
-                        group.opacity = Math.round(255 * alpha);
-
-                        // Slidefade 20% translation
-                        if (isVertical) {
-                            const desiredScreenY = delta * slideDistance;
-                            const stockScreenY = this._container.y + group.y;
-                            group.translation_y = Math.round(desiredScreenY - stockScreenY);
-                            group.translation_x = 0;
-                        } else if (isRTL) {
-                            const desiredScreenX = -delta * slideDistance;
-                            const stockScreenX = this._container.x + group.x;
-                            group.translation_x = Math.round(desiredScreenX - stockScreenX);
-                            group.translation_y = 0;
-                        } else {
-                            const desiredScreenX = delta * slideDistance;
-                            const stockScreenX = this._container.x + group.x;
-                            group.translation_x = Math.round(desiredScreenX - stockScreenX);
-                            group.translation_y = 0;
-                        }
-                    }
+                    // Windows stay solid and visible throughout the slide transition
+                    group.visible = true;
+                    group.opacity = 255;
+                    group.translation_x = 0;
+                    group.translation_y = 0;
                 }
             },
             configurable: true,
@@ -150,7 +116,7 @@ export default class CaelestiaImpl {
             return origEaseProperty.call(this, property, value, params);
         };
 
-        console.log('[Caelestia Workspaces] Slidefade 20% active');
+        console.log('[Caelestia Workspaces] Authentic Caelestia Slide (static wallpaper + expo decel) active');
     }
 
     disable() {
