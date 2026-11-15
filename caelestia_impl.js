@@ -3,6 +3,23 @@
 import * as WorkspaceAnimation from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
 import Clutter from 'gi://Clutter';
 
+const OVERSHOOT_PX = 18;
+const SLIDE_MS = 220;
+const RETURN_MS = 140;
+
+function getBounceTranslation(group, delta) {
+    const isVertical = global.workspace_manager.layout_rows === -1;
+    const overshoot = Math.sign(delta) * OVERSHOOT_PX;
+
+    if (isVertical)
+        return { x: 0, y: -overshoot };
+
+    if (group.get_text_direction() === Clutter.TextDirection.RTL)
+        return { x: overshoot, y: 0 };
+
+    return { x: -overshoot, y: 0 };
+}
+
 export default class CaelestiaImpl {
     constructor(extension) {
         this._extension = extension;
@@ -14,7 +31,7 @@ export default class CaelestiaImpl {
         if (this._origBaseDistanceDesc)
             return;
 
-        // 1. macOS Spaces: Zero gap between desktops (seamless edge-to-edge transition)
+        // 1. Seamless 0px gap between desktops
         this._origBaseDistanceDesc = Object.getOwnPropertyDescriptor(
             WorkspaceAnimation.MonitorGroup.prototype,
             'baseDistance'
@@ -23,31 +40,68 @@ export default class CaelestiaImpl {
         Object.defineProperty(WorkspaceAnimation.MonitorGroup.prototype, 'baseDistance', {
             get() {
                 const isVertical = global.workspace_manager.layout_rows === -1;
-                // Seamless: full monitor dimension with 0px spacing (unlike GNOME's default 100px gap)
                 return isVertical ? this._monitor.height : this._monitor.width;
             },
             configurable: true,
             enumerable: true,
         });
 
-        // 2. macOS Spaces: Snappy, liquid-smooth Apple spring curve (EASE_OUT_QUAD, 280ms on 120Hz)
-        // Eliminates the gummy ease-in start and dead-zone crawl at the end
+        // 2. Spring Overshoot: Slides briskly and bounces back with elastic momentum
         this._origEaseProperty = WorkspaceAnimation.MonitorGroup.prototype.ease_property;
         const origEaseProperty = this._origEaseProperty;
 
         WorkspaceAnimation.MonitorGroup.prototype.ease_property = function(property, value, params = {}) {
             if (property === 'progress') {
-                const isKeyboardSwitch = params.duration === WorkspaceAnimation.WINDOW_ANIMATION_TIME;
-                params = {
-                    ...params,
-                    duration: isKeyboardSwitch ? 280 : Math.max(220, Math.min(300, params.duration || 280)),
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                };
+                const current = this.progress;
+                const delta = value - current;
+
+                // Reset any existing translation before starting a new transition
+                if (this._container) {
+                    this._container.remove_transition('translation_x');
+                    this._container.remove_transition('translation_y');
+                    this._container.translation_x = 0;
+                    this._container.translation_y = 0;
+                }
+
+                // If delta is noticeable, perform physical spring overshoot
+                if (Math.abs(delta) > 0.05 && this._container) {
+                    const origOnComplete = params.onComplete;
+
+                    origEaseProperty.call(this, property, value, {
+                        ...params,
+                        duration: SLIDE_MS,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                        onComplete: () => {
+                            if (!this._container || this.get_stage() === null) {
+                                if (origOnComplete) origOnComplete();
+                                return;
+                            }
+
+                            // Apply inertia overshoot
+                            const { x, y } = getBounceTranslation(this, delta);
+                            this._container.translation_x = x;
+                            this._container.translation_y = y;
+
+                            // Spring back into perfect resting position
+                            this._container.ease({
+                                translation_x: 0,
+                                translation_y: 0,
+                                duration: RETURN_MS,
+                                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                                onComplete: () => {
+                                    if (origOnComplete) origOnComplete();
+                                },
+                            });
+                        },
+                    });
+                    return;
+                }
             }
+
             return origEaseProperty.call(this, property, value, params);
         };
 
-        console.log('[macOS Spaces Workspaces] Liquid-smooth EASE_OUT_QUAD (280ms) active');
+        console.log('[macOS Spaces Workspaces] Spring Overshoot animation active');
     }
 
     disable() {
