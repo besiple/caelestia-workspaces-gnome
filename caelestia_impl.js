@@ -1,31 +1,88 @@
 'use strict';
 
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as WorkspaceAnimation from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
-import * as Background from 'resource:///org/gnome/shell/ui/background.js';
 import Clutter from 'gi://Clutter';
-import Meta from 'gi://Meta';
 
-const OVERSHOOT_PX = 12;
+const OVERSHOOT_PX = 10;
 const SLIDE_MS = 220;
-const OVERSHOOT_MS = 75;
-const RETURN_MS = 125;
+const OVERSHOOT_MS = 70;
+const RETURN_MS = 120;
 
-function createStaticBackground(monitor) {
-    const container = new Meta.BackgroundGroup({
-        x: 0,
-        y: 0,
-        width: monitor.width,
-        height: monitor.height,
-    });
-    const bgManager = new Background.BackgroundManager({
-        container,
-        monitorIndex: monitor.index,
-        controlPosition: false,
-    });
-    container.connect('destroy', () => {
-        bgManager.destroy();
-    });
-    return container;
+let _dockHiddenBySwitch = false;
+
+function getDocks() {
+    const docks = [];
+    try {
+        const ext = Main.extensionManager?.lookup('dash2dock-lite@icedman.github.com');
+        const stateObj = ext?.stateObj;
+        if (stateObj?.docks) {
+            for (const d of stateObj.docks) {
+                if (d && d instanceof Clutter.Actor) {
+                    docks.push(d);
+                }
+            }
+        }
+    } catch (e) {}
+
+    // Fallback: search Main.layoutManager._chrome
+    if (docks.length === 0 && Main.layoutManager?._chrome) {
+        for (const actorData of Main.layoutManager._chrome) {
+            const actor = actorData.actor;
+            if (actor && (actor.has_style_class_name?.('dash') || actor.constructor?.name?.toLowerCase().includes('dock'))) {
+                docks.push(actor);
+            }
+        }
+    }
+    return docks;
+}
+
+function hideDocks(duration = 180) {
+    const docks = getDocks();
+    if (docks.length === 0)
+        return;
+
+    _dockHiddenBySwitch = true;
+
+    for (const dock of docks) {
+        dock.remove_transition('translation_y');
+        dock.remove_transition('opacity');
+
+        const dist = (dock.height || 70) + 30;
+        dock.ease({
+            translation_y: dist,
+            opacity: 0,
+            duration,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+        });
+    }
+}
+
+function showDocks(duration = 240) {
+    if (!_dockHiddenBySwitch)
+        return;
+
+    _dockHiddenBySwitch = false;
+    const docks = getDocks();
+
+    for (const dock of docks) {
+        dock.remove_transition('translation_y');
+        dock.remove_transition('opacity');
+
+        const shouldBeVisible = !dock._hidden;
+
+        dock.ease({
+            translation_y: 0,
+            opacity: shouldBeVisible ? 255 : 0,
+            duration,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: () => {
+                if (dock.extension?.checkHide) {
+                    dock.extension.checkHide();
+                }
+            },
+        });
+    }
 }
 
 function getBounceTranslation(group, delta) {
@@ -44,25 +101,18 @@ function getBounceTranslation(group, delta) {
 export default class CaelestiaImpl {
     constructor(extension) {
         this._extension = extension;
-        this._origMonitorInit = null;
         this._origBaseDistanceDesc = null;
         this._origEaseProperty = null;
+        this._origAnimateSwitch = null;
+        this._origSwitchWorkspaceBegin = null;
+        this._origFinishWorkspaceSwitch = null;
     }
 
     enable() {
         if (this._origBaseDistanceDesc)
             return;
 
-        const self = this;
-
-        // 1. Shield layer: Insert background behind container to block underlying real windows from peeking through
-        this._origMonitorInit = WorkspaceAnimation.MonitorGroup.prototype._init;
-        WorkspaceAnimation.MonitorGroup.prototype._init = function(monitor, workspaceIndices, movingWindow) {
-            self._origMonitorInit.call(this, monitor, workspaceIndices, movingWindow);
-            this.insert_child_below(createStaticBackground(monitor), null);
-        };
-
-        // 2. Seamless 0px gap between desktops
+        // 1. Seamless 0px gap between desktops
         this._origBaseDistanceDesc = Object.getOwnPropertyDescriptor(
             WorkspaceAnimation.MonitorGroup.prototype,
             'baseDistance'
@@ -77,7 +127,31 @@ export default class CaelestiaImpl {
             enumerable: true,
         });
 
-        // 3. Continuous Spring Overshoot: Smooth glide into overshoot + smooth return (ZERO teleportation)
+        // 2. Dock Ducking on keyboard switch
+        this._origAnimateSwitch = WorkspaceAnimation.WorkspaceAnimationController.prototype.animateSwitch;
+        const origAnimateSwitch = this._origAnimateSwitch;
+        WorkspaceAnimation.WorkspaceAnimationController.prototype.animateSwitch = function(from, to, direction, onComplete) {
+            hideDocks(180);
+            return origAnimateSwitch.call(this, from, to, direction, onComplete);
+        };
+
+        // 3. Dock Ducking on touchpad gesture swipe
+        this._origSwitchWorkspaceBegin = WorkspaceAnimation.WorkspaceAnimationController.prototype._switchWorkspaceBegin;
+        const origSwitchWorkspaceBegin = this._origSwitchWorkspaceBegin;
+        WorkspaceAnimation.WorkspaceAnimationController.prototype._switchWorkspaceBegin = function(tracker, monitor) {
+            hideDocks(180);
+            return origSwitchWorkspaceBegin.call(this, tracker, monitor);
+        };
+
+        // 4. Dock Return when switch finishes
+        this._origFinishWorkspaceSwitch = WorkspaceAnimation.WorkspaceAnimationController.prototype._finishWorkspaceSwitch;
+        const origFinishWorkspaceSwitch = this._origFinishWorkspaceSwitch;
+        WorkspaceAnimation.WorkspaceAnimationController.prototype._finishWorkspaceSwitch = function(switchData) {
+            showDocks(240);
+            return origFinishWorkspaceSwitch.call(this, switchData);
+        };
+
+        // 5. Continuous Spring Overshoot: Smooth glide into overshoot + smooth return
         this._origEaseProperty = WorkspaceAnimation.MonitorGroup.prototype.ease_property;
         const origEaseProperty = this._origEaseProperty;
 
@@ -142,14 +216,11 @@ export default class CaelestiaImpl {
             return origEaseProperty.call(this, property, value, params);
         };
 
-        console.log('[macOS Spaces Workspaces] Continuous Spring Overshoot active (zero artifacts)');
+        console.log('[macOS Spaces Workspaces] Connected with Dock ducking & Spring Overshoot');
     }
 
     disable() {
-        if (this._origMonitorInit) {
-            WorkspaceAnimation.MonitorGroup.prototype._init = this._origMonitorInit;
-            this._origMonitorInit = null;
-        }
+        showDocks(100);
 
         if (this._origBaseDistanceDesc) {
             Object.defineProperty(
@@ -158,6 +229,21 @@ export default class CaelestiaImpl {
                 this._origBaseDistanceDesc
             );
             this._origBaseDistanceDesc = null;
+        }
+
+        if (this._origAnimateSwitch) {
+            WorkspaceAnimation.WorkspaceAnimationController.prototype.animateSwitch = this._origAnimateSwitch;
+            this._origAnimateSwitch = null;
+        }
+
+        if (this._origSwitchWorkspaceBegin) {
+            WorkspaceAnimation.WorkspaceAnimationController.prototype._switchWorkspaceBegin = this._origSwitchWorkspaceBegin;
+            this._origSwitchWorkspaceBegin = null;
+        }
+
+        if (this._origFinishWorkspaceSwitch) {
+            WorkspaceAnimation.WorkspaceAnimationController.prototype._finishWorkspaceSwitch = this._origFinishWorkspaceSwitch;
+            this._origFinishWorkspaceSwitch = null;
         }
 
         if (this._origEaseProperty) {
